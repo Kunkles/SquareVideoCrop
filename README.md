@@ -43,6 +43,10 @@ Then build and run the **SquareVideoCrop** scheme in Xcode (⌘R).
 - `CropOverlay` keeps the crop square in video-pixel space and renders the safety circle.
 - The export pipeline in `ContentView` builds an `AVMutableVideoComposition`, translating the crop into the source's coordinate space (bottom-left origin for portrait, top-left for landscape) and rendering exactly the square crop with no scaling.
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for version history and notable changes.
+
 ## License
 
 No license specified yet — all rights reserved by default. Add a `LICENSE` file if you want to allow reuse.
