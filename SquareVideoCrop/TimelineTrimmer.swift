@@ -11,7 +11,7 @@ struct TimelineTrimmer: View {
     // Transport control callbacks
     var onPlay: (() -> Void)?
     var onPause: (() -> Void)?
-    var onSeek: ((Double) -> Void)?  // Called when skip buttons are used
+    var onSeek: ((Double) -> Void)?  // Called for every user-driven playhead change (scrub, trim, skip)
     var isPlaying: Bool = false
     var onLoopChanged: ((Bool) -> Void)?  // Notify parent of loop state changes
 
@@ -21,6 +21,7 @@ struct TimelineTrimmer: View {
     private let handleHitW: CGFloat = 10           // horizontal hit radius for handles (for picking mode) - matches visual width
 
     @State private var thumbs: [NSImage] = []
+    @State private var thumbTask: Task<Void, Never>?
     @State private var dur: Double = 0
     @State private var loopEnabled: Bool = false
     @State private var fps: Double = 30.0  // Default to 30fps, will be updated from asset
@@ -140,12 +141,25 @@ struct TimelineTrimmer: View {
                                             } else {
                                                 activeDrag = .scrub
                                             }
+
+                                            // Pause while setting a trim point so the preview
+                                            // holds on the handle's frame
+                                            if activeDrag != .scrub && isPlaying {
+                                                onPause?()
+                                            }
                                         }
 
                                         // Current x → normalized [0,1] → time
                                         let clampedX = max(0, min(w, g.location.x))
                                         let norm = clampedX / max(w, 0.0001)
                                         let t = Double(norm) * safeDur
+
+                                        let oldPlayhead = playhead
+                                        defer {
+                                            // Seek explicitly for user-driven playhead changes so
+                                            // scrubbing also works while the video is playing.
+                                            if playhead != oldPlayhead { onSeek?(playhead) }
+                                        }
 
                                         switch activeDrag {
                                         case .scrub:
@@ -160,8 +174,8 @@ struct TimelineTrimmer: View {
                                             // Clamp not below zero
                                             newStart = max(0, newStart)
                                             start = newStart
-                                            // keep playhead inside window
-                                            playhead = max(start, min(playhead, end))
+                                            // Follow the handle so the video previews the in point
+                                            playhead = start
 
                                         case .rightHandle:
                                             // Move end, keep at least 0.1s window
@@ -169,8 +183,8 @@ struct TimelineTrimmer: View {
                                             newEnd = max(newEnd, start + 0.1)
                                             newEnd = min(totalDur, newEnd)
                                             end = newEnd
-                                            // keep playhead inside window
-                                            playhead = max(start, min(playhead, end))
+                                            // Follow the handle so the video previews the out point
+                                            playhead = end
 
                                         case .none:
                                             break
@@ -267,14 +281,7 @@ struct TimelineTrimmer: View {
         }
         .onAppear { load() }
         .onChange(of: asset) { _, _ in load() }
-        .onChange(of: playhead) { _, newValue in
-            // Loop playback if enabled and playing
-            if loopEnabled && isPlaying && newValue >= end {
-                playhead = start
-                onSeek?(start)
-                onPlay?()  // Restart playback
-            }
-        }
+        .onDisappear { thumbTask?.cancel() }
         .frame(height: stripHeight + 56)
     }
 
@@ -334,30 +341,30 @@ struct TimelineTrimmer: View {
     }
 
     private func generateThumbs(count: Int = 8) {
+        thumbTask?.cancel()
         thumbs.removeAll()
+
+        let duration = dur
+        guard duration > 0 else { return }
 
         let gen = AVAssetImageGenerator(asset: asset)
         gen.appliesPreferredTrackTransform = true
         gen.maximumSize = CGSize(width: 320, height: 320)
 
-        let times: [NSValue] = (0..<count).map { i in
-            let t = Double(i) / Double(max(1, count - 1)) * dur
-            return NSValue(time: CMTime(seconds: t, preferredTimescale: 600))
-        }
-
-        var images = Array<NSImage?>(repeating: nil, count: count)
-
-        gen.generateCGImagesAsynchronously(forTimes: times) { requestedTime, cg, _, _, _ in
-            guard let cg = cg else { return }
-            let idx = times.firstIndex(where: { CMTimeCompare($0.timeValue, requestedTime) == 0 }) ?? 0
-            if idx < images.count {
-                images[idx] = NSImage(cgImage: cg, size: .zero)
-            }
-            if images.allSatisfy({ $0 != nil }) {
-                DispatchQueue.main.async {
-                    thumbs = images.compactMap { $0 }
+        thumbTask = Task { @MainActor in
+            var images: [NSImage] = []
+            for i in 0..<count {
+                // Sample the middle of each slot. (Requesting a frame exactly at the end
+                // of the file often fails, which previously left the strip blank.)
+                let t = (Double(i) + 0.5) / Double(count) * duration
+                if let (cg, _) = try? await gen.image(at: CMTime(seconds: t, preferredTimescale: 600)) {
+                    images.append(NSImage(cgImage: cg, size: .zero))
+                } else if let last = images.last {
+                    images.append(last)   // keep the strip evenly filled if one frame fails
                 }
+                if Task.isCancelled { return }   // asset changed; don't show stale thumbs
             }
+            thumbs = images
         }
     }
 

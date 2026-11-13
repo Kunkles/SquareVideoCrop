@@ -64,14 +64,10 @@ struct SquareCropOverlayStrict: View {
                 .position(x: px.midX, y: px.midY)
 
             // Corner handles
-            handle(at: px.origin)
-                .gesture(cornerDrag(handle: .topLeft, videoRect: videoRect))
-            handle(at: CGPoint(x: px.maxX, y: px.origin.y))
-                .gesture(cornerDrag(handle: .topRight, videoRect: videoRect))
-            handle(at: CGPoint(x: px.origin.x, y: px.maxY))
-                .gesture(cornerDrag(handle: .bottomLeft, videoRect: videoRect))
-            handle(at: CGPoint(x: px.maxX, y: px.maxY))
-                .gesture(cornerDrag(handle: .bottomRight, videoRect: videoRect))
+            handle(.topLeft, at: px.origin, videoRect: videoRect)
+            handle(.topRight, at: CGPoint(x: px.maxX, y: px.origin.y), videoRect: videoRect)
+            handle(.bottomLeft, at: CGPoint(x: px.origin.x, y: px.maxY), videoRect: videoRect)
+            handle(.bottomRight, at: CGPoint(x: px.maxX, y: px.maxY), videoRect: videoRect)
 
             // Body drag (move crop)
             Rectangle()
@@ -81,10 +77,6 @@ struct SquareCropOverlayStrict: View {
                        height: max(0, px.height - handleHitSize))
                 .position(x: px.midX, y: px.midY)
                 .gesture(bodyDrag(videoRect: videoRect))
-        }
-        .onAppear {
-            // Don't override crop on appear - it's already set correctly by ContentView
-            // crop = clampedPixelSquare(crop, videoRect: videoRect)
         }
     }
 
@@ -99,63 +91,40 @@ struct SquareCropOverlayStrict: View {
                 }
                 
                 // Work in video pixel space for true square behavior
-                let startPxW = dragStartCrop.width * videoUprightSize.width
-                let startPxH = dragStartCrop.height * videoUprightSize.height
-                let startSide = min(startPxW, startPxH)
-                
-                // Use dominant axis delta
-                let dx = g.translation.width
-                let dy = g.translation.height
-                let delta = (abs(dx) > abs(dy)) ? dx : dy
-                
-                // Scale delta to video pixel space
-                // Use the dimension that corresponds to the smaller video dimension
-                let scaleFactor = min(videoUprightSize.width, videoUprightSize.height) / min(videoRect.width, videoRect.height)
-                let deltaPx = delta * scaleFactor
-                
-                // Calculate new square side in pixels
-                var newSidePx = startSide
-                switch handle {
-                case .topLeft, .bottomLeft:
-                    newSidePx = startSide - deltaPx
-                case .topRight, .bottomRight:
-                    newSidePx = startSide + deltaPx
-                case .body:
-                    break
-                }
-                
-                // Clamp to video bounds
-                let minPx = minSideNorm * min(videoUprightSize.width, videoUprightSize.height)
-                newSidePx = max(minPx, min(newSidePx, videoUprightSize.width, videoUprightSize.height))
-                
-                // Convert back to normalized (CRITICAL: use same pixel size for both dimensions)
-                let normW = newSidePx / videoUprightSize.width
-                let normH = newSidePx / videoUprightSize.height
-                
-                var newCrop = dragStartCrop
-                newCrop.size = CGSize(width: normW, height: normH)
-                
-                // Adjust position based on handle
-                let startNormW = dragStartCrop.width
-                let startNormH = dragStartCrop.height
-                
-                switch handle {
-                case .topLeft:
-                    newCrop.origin.x = dragStartCrop.origin.x + (startNormW - normW)
-                    newCrop.origin.y = dragStartCrop.origin.y + (startNormH - normH)
-                case .topRight:
-                    newCrop.origin.y = dragStartCrop.origin.y + (startNormH - normH)
-                case .bottomLeft:
-                    newCrop.origin.x = dragStartCrop.origin.x + (startNormW - normW)
-                case .bottomRight, .body:
-                    break
-                }
-                
-                // Clamp position
-                newCrop.origin.x = max(0, min(newCrop.origin.x, 1 - normW))
-                newCrop.origin.y = max(0, min(newCrop.origin.y, 1 - normH))
-                
-                crop = newCrop
+                let W = videoUprightSize.width
+                let H = videoUprightSize.height
+                guard W > 0, H > 0, videoRect.width > 0 else { return }
+
+                let x0 = dragStartCrop.minX * W
+                let y0 = dragStartCrop.minY * H
+                let startSide = min(dragStartCrop.width * W, dragStartCrop.height * H)
+
+                let isLeft = (handle == .topLeft || handle == .bottomLeft)
+                let isTop  = (handle == .topLeft || handle == .topRight)
+
+                // The corner opposite the dragged handle stays fixed.
+                let anchorX = isLeft ? x0 + startSide : x0
+                let anchorY = isTop  ? y0 + startSide : y0
+
+                // Screen points -> video pixels (aspect-fit, so the scale is uniform)
+                let scale = W / videoRect.width
+
+                // Positive = "outward" from the anchor, so the square grows.
+                let growX = (isLeft ? -g.translation.width  : g.translation.width)  * scale
+                let growY = (isTop  ? -g.translation.height : g.translation.height) * scale
+                let grow = abs(growX) > abs(growY) ? growX : growY
+
+                // Largest square that fits between the anchor and the video edges
+                let maxSide = min(isLeft ? anchorX : W - anchorX,
+                                  isTop  ? anchorY : H - anchorY)
+                let minSide = min(minSideNorm * min(W, H), maxSide)
+                let side = max(minSide, min(startSide + grow, maxSide))
+
+                let nx = isLeft ? anchorX - side : anchorX
+                let ny = isTop  ? anchorY - side : anchorY
+
+                // Same pixel side for both dimensions -> different normalized values
+                crop = CGRect(x: nx / W, y: ny / H, width: side / W, height: side / H)
             }
             .onEnded { _ in
                 activeHandle = nil
@@ -254,21 +223,25 @@ struct SquareCropOverlayStrict: View {
 
     // MARK: - Drawing helpers
 
-    private func handle(at point: CGPoint) -> some View {
+    /// Corner handle. The gesture is attached *before* `.position` so the hit area is
+    /// just the small handle circle, not the whole overlay (a positioned view fills its
+    /// parent, which previously let the last handle swallow drags for all four corners).
+    private func handle(_ h: Handle, at point: CGPoint, videoRect: CGRect) -> some View {
         ZStack {
             // big invisible hit target
             Circle()
                 .fill(Color.white.opacity(0.001))
                 .frame(width: handleHitSize, height: handleHitSize)
-                .position(point)
             // visible knob
             Circle()
                 .fill(Color.white)
                 .frame(width: handleSize, height: handleSize)
-                .position(point)
                 .shadow(color: .black.opacity(0.5), radius: 1)
         }
-        .contentShape(Rectangle())
+        .frame(width: handleHitSize, height: handleHitSize)
+        .contentShape(Circle())
+        .gesture(cornerDrag(handle: h, videoRect: videoRect))
+        .position(point)
     }
 
     private func grid(in rect: CGRect) -> Path {

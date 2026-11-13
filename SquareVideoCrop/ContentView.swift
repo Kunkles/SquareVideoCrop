@@ -5,6 +5,7 @@ import AVKit
 import UniformTypeIdentifiers
 import AppKit
 import CoreMedia
+import Combine
 
 // Avoid Sendable warnings when we pass AVAssetExportSession into closures.
 final class UncheckedBox<T>: @unchecked Sendable {
@@ -68,7 +69,10 @@ fileprivate struct SquareTrimExport {
                 }
 
                 let prefT = try await vTrack.load(.preferredTransform)
-                let fps   = max(try await vTrack.load(.nominalFrameRate), 30)
+                // Keep the source frame rate (forcing a 30 fps minimum made 24 fps footage
+                // judder, and truncating 59.94 to Int gave 59 fps).
+                let nominalFPS = try await vTrack.load(.nominalFrameRate)
+                let fps = nominalFPS > 0 ? Double(nominalFPS) : 30.0
 
                 // Orientation flag from track transform
                 let isPortrait = abs(prefT.b) == 1.0 && abs(prefT.c) == 1.0
@@ -101,8 +105,9 @@ fileprivate struct SquareTrimExport {
                 let wPxFull = wNorm * W
                 let hPxFull = hNorm * H
 
-                // Square side in pixels
-                let sidePx = min(wPxFull, hPxFull)
+                // Square side in pixels, snapped down to an even number (H.264 needs
+                // even dimensions; odd sizes can produce a green/garbage edge line).
+                let sidePx = max(2, floor(min(wPxFull, hPxFull) / 2) * 2)
 
                 // Center in pixels
                 let cxPx = cxNorm * W
@@ -117,18 +122,15 @@ fileprivate struct SquareTrimExport {
                 let cropPxTL = CGRect(
                     x: round(xPx),
                     y: round(yPx),
-                    width: round(sidePx),
-                    height: round(sidePx)
+                    width: sidePx,
+                    height: sidePx
                 )
 
                 // Render exactly the square crop size (no scaling)
-                let cropW = CGFloat(Int(cropPxTL.width.rounded()))
-                let cropH = CGFloat(Int(cropPxTL.height.rounded()))
-
                 let vc = AVMutableVideoComposition()
-                vc.renderSize = CGSize(width: cropW, height: cropH)
+                vc.renderSize = CGSize(width: sidePx, height: sidePx)
 
-                vc.frameDuration = CMTime(value: 1, timescale: Int32(fps))
+                vc.frameDuration = CMTime(seconds: 1.0 / fps, preferredTimescale: 60000)
 
                 let timeRange = CMTimeRange(
                     start: CMTime(seconds: s, preferredTimescale: 600),
@@ -180,7 +182,18 @@ fileprivate struct SquareTrimExport {
                 try? FileManager.default.removeItem(at: outputURL)
 
                 if #available(macOS 15.0, *) {
+                    // The async export API doesn't report progress on its own;
+                    // watch its state stream so the progress bar actually moves.
+                    let progressTask = Task { @MainActor in
+                        for await state in exporter.states(updateInterval: 0.1) {
+                            if case .exporting(let p) = state {
+                                progress(Float(p.fractionCompleted))
+                            }
+                        }
+                    }
+                    defer { progressTask.cancel() }
                     try await exporter.export(to: outputURL, as: .mp4)
+                    progress(1)
                     completion(.success(outputURL))
                 } else {
                     exporter.outputURL = outputURL
@@ -227,8 +240,11 @@ struct ContentView: View {
     @State private var isWorking = false
     @State private var progress: Float = 0
     @State private var isPlaying = false
-    @State private var isSeekingFromUser = false  // Prevent feedback loop
     @State private var isLooping = false  // Track loop state
+    @State private var timeObserver: Any?  // Periodic observer token for the current player
+    @State private var loadingURL: URL?    // Guards against overlapping loads
+    @State private var isSeeking = false   // A seek is in flight
+    @State private var pendingSeek: Double? // Latest seek requested while one was in flight
     @State private var status = "Drop a video to begin."
 
     var body: some View {
@@ -279,37 +295,18 @@ struct ContentView: View {
                     start: $startTime,
                     end: $endTime,
                     playhead: $playhead,
-                    onPlay: {
-                        player?.play()
-                        isPlaying = true
-                    },
+                    onPlay: play,
                     onPause: {
                         player?.pause()
                         isPlaying = false
                     },
-                    onSeek: { time in
-                        let t = CMTime(seconds: time, preferredTimescale: 600)
-                        player?.seek(to: t,
-                                     toleranceBefore: .zero,
-                                     toleranceAfter: .zero,
-                                     completionHandler: { _ in })
-                    },
+                    onSeek: seek(to:),
                     isPlaying: isPlaying,
                     onLoopChanged: { enabled in
                         isLooping = enabled
                     }
                 )
                 .frame(maxWidth: .infinity)
-                .onChange(of: playhead) { _, new in
-                    // Only seek if the change came from user interaction, not from the time observer
-                    if !isPlaying {
-                        let t = CMTime(seconds: new, preferredTimescale: 600)
-                        player?.seek(to: t,
-                                     toleranceBefore: .zero,
-                                     toleranceAfter: .zero,
-                                     completionHandler: { _ in })
-                    }
-                }
             }
 
             // Telemetry info (commented out)
@@ -348,7 +345,76 @@ struct ContentView: View {
             }
         }
         .padding(16)
+        // Accept drops anywhere in the window, so a new video can replace the current one
+        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+            guard let p = providers.first else { return false }
+            _ = p.loadObject(ofClass: URL.self) { url, _ in
+                if let url { DispatchQueue.main.async { load(url) } }
+            }
+            return true
+        }
+        // When the trim end is the end of the file, the player stops by itself and the
+        // periodic observer never sees `time >= endTime` while playing.
+        .onReceive(NotificationCenter.default
+            .publisher(for: AVPlayerItem.didPlayToEndTimeNotification)
+            .receive(on: RunLoop.main)
+        ) { note in
+            guard let item = note.object as? AVPlayerItem,
+                  item === player?.currentItem,
+                  isPlaying else { return }
+            reachedTrimEnd()
+        }
         .onDisappear { player?.pause() }
+    }
+
+    // MARK: - Playback
+
+    /// Frame-accurate seek that coalesces rapid requests (scrubbing, dragging trim handles):
+    /// only one seek is in flight at a time, and when it lands we jump to the latest
+    /// requested time. Firing a new exact seek on every drag event would keep cancelling
+    /// the previous one, so the preview frame wouldn't update until you stopped moving.
+    private func seek(to time: Double) {
+        guard let player else { return }
+        if isSeeking {
+            pendingSeek = time
+            return
+        }
+        isSeeking = true
+        let t = CMTime(seconds: time, preferredTimescale: 600)
+        player.seek(to: t, toleranceBefore: .zero, toleranceAfter: .zero) { _ in
+            Task { @MainActor in
+                isSeeking = false
+                if let next = pendingSeek {
+                    pendingSeek = nil
+                    seek(to: next)
+                }
+            }
+        }
+    }
+
+    private func play() {
+        guard let player else { return }
+        // If we're parked at (or outside) the trim end, start over from the trim start
+        if playhead >= endTime - 0.01 || playhead < startTime {
+            playhead = startTime
+            seek(to: startTime)
+        }
+        player.play()
+        isPlaying = true
+    }
+
+    private func reachedTrimEnd() {
+        guard let player else { return }
+        if isLooping {
+            playhead = startTime
+            seek(to: startTime)
+            player.play()
+            isPlaying = true
+        } else {
+            player.pause()
+            isPlaying = false
+            playhead = endTime
+        }
     }
 
     private var header: some View {
@@ -371,13 +437,6 @@ struct ContentView: View {
                 Text("MP4 / MOV").font(.caption).foregroundStyle(.secondary)
             }
         }
-        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
-            guard let p = providers.first else { return false }
-            _ = p.loadObject(ofClass: URL.self) { url, _ in
-                if let url { DispatchQueue.main.async { load(url) } }
-            }
-            return true
-        }
     }
 
     private func chooseFile() {
@@ -393,18 +452,41 @@ struct ContentView: View {
     }
 
     private func load(_ url: URL) {
-        inputURL = url
+        guard UTType(filenameExtension: url.pathExtension)?.conforms(to: .movie) == true else {
+            status = "Not a video file: \(url.lastPathComponent)"
+            return
+        }
+
+        loadingURL = url
         status = "Loading…"
 
+        // Stop the current video while the new one loads
+        player?.pause()
+        isPlaying = false
+
         let a = AVURLAsset(url: url)
-        asset = a
 
         Task { @MainActor in
             do {
                 let u = try await VideoGeometry.upright(from: a)
+                let d: CMTime = try await a.load(.duration)
+
+                // A newer load started while we were awaiting; let it win
+                guard loadingURL == url else { return }
+
+                // Tear down the previous player and its observer
+                if let old = player, let token = timeObserver {
+                    old.removeTimeObserver(token)
+                }
+                timeObserver = nil
+                isSeeking = false
+                pendingSeek = nil
+
+                // Only commit state once the asset is known-good, so a failed load
+                // leaves the previous video intact.
+                inputURL = url
                 uprightPx = u.size
 
-                let d: CMTime = try await a.load(.duration)
                 let secs = max(0, CMTimeGetSeconds(d))
                 startTime = 0
                 endTime   = secs
@@ -421,6 +503,8 @@ struct ContentView: View {
 
                 cropNorm = CGRect(x: normX, y: normY, width: normW, height: normH)
 
+                asset = a
+
                 let item = AVPlayerItem(asset: a)
                 let p = AVPlayer(playerItem: item)
                 player = p
@@ -432,21 +516,19 @@ struct ContentView: View {
                 // Add periodic time observer to update playhead during playback
                 // Use 15 FPS for smoother performance
                 let interval = CMTime(seconds: 0.067, preferredTimescale: 600)
-                p.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak p] time in
-                    guard let p = p else { return }
+                timeObserver = p.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak p] time in
+                    guard let p, p.rate > 0 else { return } // Only update if playing
                     let currentTime = CMTimeGetSeconds(time)
-                    if p.rate > 0 { // Only update if playing
-                        playhead = currentTime
-                        // Auto-pause at end of trim (unless looping)
-                        if currentTime >= endTime && !isLooping {
-                            p.pause()
-                            isPlaying = false
-                        }
+                    playhead = currentTime
+                    // Stop or loop at the end of the trim
+                    if currentTime >= endTime {
+                        reachedTrimEnd()
                     }
                 }
 
                 status = "Ready."
             } catch {
+                guard loadingURL == url else { return }
                 status = "Error loading: \(error.localizedDescription)"
             }
         }

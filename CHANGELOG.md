@@ -11,7 +11,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Project `README.md` and this `CHANGELOG.md`
 
 ### Changed
+- Dragging a trim handle now previews that frame in the video (the playhead follows the handle, and playback pauses while you set the point)
+- Scrubbing and trim-handle seeks are coalesced so the preview keeps up with fast drags
 - About window is now opened only from the menu, instead of auto-popping 0.5s after every launch
+
+### Fixed
+- Crop corner handles: the bottom-right handle's hit area covered the whole overlay, so the other three corners couldn't be grabbed
+- Crop corner handles: vertical drags on the top-right and bottom-left corners resized in the wrong direction; the opposite corner now stays anchored instead of drifting when the square hits the video edge
+- Playback: with the trim end at the end of the file, the Play/Pause button got stuck on "Pause" and loop didn't restart
+- Playback: pressing Play at the end of the trim now restarts from the trim start instead of doing nothing
+- Playback: scrubbing the timeline while the video is playing now seeks
+- Loading a second video no longer leaves the first one playing or leaks its time observer, and a failed load keeps the current video
+- Dropping a video works after one is already loaded (previously only on the empty drop zone); non-video files are rejected
+- Timeline thumbnails could stay blank when the frame at the very end of the file failed to decode
+- Export progress bar didn't move on macOS 15+
+- Export frame rate now matches the source (it was forced to at least 30 fps, causing judder on 24 fps footage, and 59.94 fps was truncated to 59)
+- Export size is snapped to even dimensions for H.264
 
 ### Removed
 - `SquareCropOverlayStrict.swift` — a fully commented-out dead file (the live overlay lives in `CropOverlay.swift`)
